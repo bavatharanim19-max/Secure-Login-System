@@ -1,0 +1,200 @@
+
+const express = require("express");
+const bcrypt = require("bcrypt");
+const Database = require("better-sqlite3");
+const session = require("express-session");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const app = express();
+const db = new Database("users.db");
+
+app.use(helmet());
+app.use(express.json({ limit: "10kb" }));
+
+db.exec(`CREATE TABLE IF NOT EXISTS users(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ email TEXT UNIQUE NOT NULL,
+ password TEXT NOT NULL
+)`);
+
+app.use(session({
+ secret: process.env.SESSION_SECRET || "replace-this-secret",
+ resave: false,
+ saveUninitialized: false,
+ cookie: {
+   httpOnly: true,
+   sameSite: "lax",
+   secure: process.env.NODE_ENV === "production",
+   maxAge: 1800000
+ }
+}));
+
+const limiter = rateLimit({
+ windowMs: 15 * 60 * 1000,
+ limit: 10
+});
+
+app.get("/", (req, res) => {
+ res.send(`<!DOCTYPE html>
+<html>
+<head>
+<title>Secure Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:Arial;background:#d8f3dc;display:grid;
+place-items:center;min-height:90vh}
+.card{background:white;padding:30px;border-radius:15px;
+width:300px;box-shadow:0 5px 20px #0002}
+h2{text-align:center;color:#1b4332}
+input,button{box-sizing:border-box;width:100%;padding:12px;
+margin:8px 0;border-radius:6px}
+input{border:1px solid #aaa}
+button{background:#2d6a4f;color:white;border:0;cursor:pointer}
+#message{text-align:center;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>🔐 Secure Login</h2>
+<form id="form">
+<input id="email" type="email" placeholder="Email" required>
+<input id="password" type="password"
+placeholder="Password (8+ characters)" minlength="8"
+maxlength="72" required>
+<button id="submit">Register</button>
+</form>
+<button id="toggle" type="button">Already registered? Login</button>
+<button id="logout" type="button" hidden>Logout</button>
+<p id="message" role="status" aria-live="polite"></p>
+</div>
+<script>
+let login=false;
+const form=document.getElementById("form");
+const msg=document.getElementById("message");
+const submit=document.getElementById("submit");
+const logout=document.getElementById("logout");
+
+document.getElementById("toggle").onclick=()=>{
+ login=!login;
+ submit.textContent=login?"Login":"Register";
+ document.getElementById("toggle").textContent=
+ login?"New user? Register":"Already registered? Login";
+ document.getElementById("password").autocomplete=
+ login?"current-password":"new-password";
+ msg.textContent="";
+};
+
+form.onsubmit=async e=>{
+ e.preventDefault();
+ msg.textContent="Please wait...";
+ try{
+  const r=await fetch(login?"/login":"/register",{
+   method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({
+    email:document.getElementById("email").value,
+    password:document.getElementById("password").value
+   })
+  });
+  const d=await r.json();
+  msg.textContent=d.message;
+  if(r.ok&&login){
+   form.hidden=true;
+   document.getElementById("toggle").hidden=true;
+   logout.hidden=false;
+  }else if(r.ok){
+   login=true;
+   submit.textContent="Login";
+   document.getElementById("toggle").textContent="New user? Register";
+   document.getElementById("password").value="";
+  }
+ }catch{msg.textContent="Server connection failed."}
+};
+
+logout.onclick=async()=>{
+ try{
+  const r=await fetch("/logout",{method:"POST"});
+  const d=await r.json();
+  msg.textContent=d.message;
+  if(r.ok)location.reload();
+ }catch{msg.textContent="Server connection failed."}
+};
+
+fetch("/me").then(async r=>{
+ if(r.ok){
+  const d=await r.json();
+  form.hidden=true;
+  document.getElementById("toggle").hidden=true;
+  logout.hidden=false;
+  msg.textContent="Welcome, "+d.email;
+ }
+}).catch(()=>{});
+</script>
+</body>
+</html>`);
+});
+
+app.post("/register",async(req,res)=>{
+ const {email,password}=req.body;
+ if(typeof email!=="string"||email.length>254||
+ !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||
+ typeof password!=="string"||password.length<8||
+ Buffer.byteLength(password,"utf8")>72){
+  return res.status(400).json({message:"Invalid email or password."});
+ }
+ try{
+  const hash=await bcrypt.hash(password,12);
+  db.prepare("INSERT INTO users(email,password) VALUES(?,?)")
+   .run(email.trim().toLowerCase(),hash);
+  res.status(201).json({message:"Registered successfully! Please login."});
+ }catch(e){
+  if(e.code==="SQLITE_CONSTRAINT_UNIQUE")
+   return res.status(409).json({message:"Email already registered."});
+  res.status(500).json({message:"Server error."});
+ }
+});
+
+app.post("/login",limiter,async(req,res)=>{
+ const {email,password}=req.body;
+ if(typeof email!=="string"||email.length>254||
+ typeof password!=="string"||
+ Buffer.byteLength(password,"utf8")>72){
+  return res.status(400).json({message:"Invalid input."});
+ }
+ const user=db.prepare("SELECT * FROM users WHERE email=?")
+  .get(email.trim().toLowerCase());
+ if(!user||!(await bcrypt.compare(password,user.password)))
+  return res.status(401).json({message:"Invalid email or password."});
+
+ req.session.regenerate(err=>{
+  if(err)return res.status(500).json({message:"Session error."});
+  req.session.userId=user.id;
+  req.session.save(err=>{
+   if(err)return res.status(500).json({message:"Session error."});
+   res.json({message:"Login successful!"});
+  });
+ });
+});
+
+app.get("/me",(req,res)=>{
+ if(!req.session.userId)
+  return res.status(401).json({message:"Please login."});
+ const user=db.prepare("SELECT email FROM users WHERE id=?")
+  .get(req.session.userId);
+ if(!user)return res.status(401).json({message:"Please login."});
+ res.json({email:user.email});
+});
+
+app.post("/logout",(req,res)=>{
+ req.session.destroy(err=>{
+  if(err)return res.status(500).json({message:"Logout failed."});
+  res.clearCookie("connect.sid",{
+   httpOnly:true,
+   sameSite:"lax",
+   secure:process.env.NODE_ENV==="production"
+  });
+  res.json({message:"Logged out successfully."});
+ });
+});
+
+app.listen(3000,()=>console.log("Open http://localhost:3000"));
